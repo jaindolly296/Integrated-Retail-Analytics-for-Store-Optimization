@@ -1,0 +1,3 @@
+Segment,Segment_Name,Stores,Scored_Records,MAE,WAPE_Percent,Bias_Percent
+0,"Larger stores, higher sales",35,31385,1419.1167168747154,8.13819386915284,0.17292744688885128
+1,"Smaller stores, lower variability",10,6624,600.45018257287,7.2938514237150915,-0.2624676598873363

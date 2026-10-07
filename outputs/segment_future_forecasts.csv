@@ -1,0 +1,5 @@
+Segment_Name,Target_Date,Horizon_Weeks,Stores,Department_Records,Predicted_Sales
+"Larger stores, higher sales",2012-11-02,1,35,2435,43703343.31403734
+"Larger stores, higher sales",2013-01-25,13,35,2435,35868089.49
+"Smaller stores, lower variability",2012-11-02,1,10,524,4312620.513817135
+"Smaller stores, lower variability",2013-01-25,13,10,524,3978838.08

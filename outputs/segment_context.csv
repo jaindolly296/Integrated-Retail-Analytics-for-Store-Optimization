@@ -1,0 +1,3 @@
+Segment_Name,Stores,Mean_Temperature,Mean_Fuel_Price,Mean_CPI,Mean_Unemployment,Mean_Recorded_MarkDown1,Markdown_Availability_Percent
+"Larger stores, higher sales",35,55.44330158730159,3.282889133089133,168.13160941833945,8.03910354090354,8647.98409142857,20.82051282051282
+"Smaller stores, lower variability",10,66.92888888888889,3.2539299145299148,179.32786931897436,8.6017,980.505506594203,16.22222222222222
