@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 27460)
-Total output lines: 4072
-
 # -*- coding: utf-8 -*-
 """Retail_Analytics.ipynb
 
@@ -591,7 +588,2931 @@ type_summary = (
     .agg(
         Stores=("Store", "nunique"),
         Mean_Store_Weekly_Sales=("Weekly_Sales", "mean"),
-        Store_Weeks=("…19460 tokens truncated…ek.to_csv(
+        Store_Weeks=("Weekly_Sales", "count")
+    )
+)
+
+display(type_summary.round(2))
+
+(type_summary["Mean_Store_Weekly_Sales"] / 1_000_000).plot(
+    kind="bar",
+    figsize=(7, 4),
+    color="seagreen"
+)
+
+plt.title("Average Weekly Store Sales by Store Type")
+plt.xlabel("Store Type")
+plt.ylabel("Mean Weekly Store Sales (Millions)")
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.show()
+
+"""## Calendar Feature Engineering
+
+We extract year, month, ISO week number, and quarter from Date.
+These features can help models identify time-related sales patterns.
+
+We keep the original Date column for chronological splitting
+and time-series analysis.
+"""
+
+merged_data["Year"] = merged_data["Date"].dt.year
+merged_data["Month"] = merged_data["Date"].dt.month
+merged_data["WeekOfYear"] = (
+    merged_data["Date"].dt.isocalendar().week.astype(int)
+)
+merged_data["Quarter"] = merged_data["Date"].dt.quarter
+
+display(
+    merged_data[
+        ["Date", "Year", "Month", "WeekOfYear", "Quarter"]
+    ].head()
+)
+
+"""## Markdown Missingness Indicators
+
+We create a binary indicator for each markdown column:
+1 means the original value is missing, and 0 means it is available.
+
+The original markdown values are preserved. Missing values are
+not assumed to mean zero promotion. Any later imputation will
+be fitted using training data only to avoid data leakage.
+"""
+
+markdown_columns = [
+    "MarkDown1",
+    "MarkDown2",
+    "MarkDown3",
+    "MarkDown4",
+    "MarkDown5"
+]
+
+for column in markdown_columns:
+    merged_data[column + "_Missing"] = (
+        merged_data[column].isna().astype(int)
+    )
+
+display(
+    merged_data[
+        [
+            "Date",
+            "MarkDown1",
+            "MarkDown1_Missing",
+            "MarkDown2",
+            "MarkDown2_Missing"
+        ]
+    ].head()
+)
+
+"""## Saving a Prepared Data Checkpoint
+
+We save the merged dataset with calendar features and markdown
+missingness indicators to Google Drive.
+
+This checkpoint preserves our progress without overwriting the
+original CSV files. Missing values and negative sales remain
+available for further investigation.
+"""
+
+output_folder = data_folder.parent / "outputs"
+output_folder.mkdir(parents=True, exist_ok=True)
+
+prepared_file = output_folder / "prepared_sales.csv.gz"
+
+merged_data.to_csv(
+    prepared_file,
+    index=False,
+    compression="gzip"
+)
+
+print("Prepared data shape:", merged_data.shape)
+print("Saved successfully:", prepared_file.exists())
+print("Saved at:", prepared_file)
+
+"""## Chronological Data Split
+
+For one-week-ahead forecasting, we reserve the last 13 observed
+weeks for testing and the preceding 13 weeks for validation.
+Earlier observations form the training set.
+
+Training data is used to learn patterns. Validation data helps
+compare models. Test data is reserved for the final evaluation.
+We do not randomly shuffle time-series observations.
+
+Longer forecast horizons will require additional gaps between
+training and evaluation periods to avoid future-data leakage.
+"""
+
+all_dates = sorted(merged_data["Date"].unique())
+
+validation_start = pd.Timestamp(all_dates[-26])
+test_start = pd.Timestamp(all_dates[-13])
+
+train_data = merged_data[
+    merged_data["Date"] < validation_start
+].copy()
+
+validation_data = merged_data[
+    (merged_data["Date"] >= validation_start)
+    & (merged_data["Date"] < test_start)
+].copy()
+
+test_data = merged_data[
+    merged_data["Date"] >= test_start
+].copy()
+
+for name, dataset in [
+    ("Training", train_data),
+    ("Validation", validation_data),
+    ("Test", test_data)
+]:
+    print(
+        name,
+        ":",
+        dataset["Date"].min().date(),
+        "to",
+        dataset["Date"].max().date()
+    )
+
+"""## One-Week-Ahead Naive Baseline
+
+Our first forecasting baseline predicts that a department's
+sales this week will equal its sales exactly seven days earlier.
+
+We match records using Store, Dept, and Date. An exact date
+match prevents missing weeks from being mistaken for consecutive
+weeks. Missing historical observations remain unavailable.
+"""
+
+previous_week = merged_data[
+    ["Store", "Dept", "Date", "Weekly_Sales"]
+].copy()
+
+previous_week = previous_week.rename(
+    columns={"Weekly_Sales": "Last_Week_Sales"}
+)
+
+previous_week["Date"] = (
+    previous_week["Date"] + pd.Timedelta(days=7)
+)
+
+baseline_data = merged_data.merge(
+    previous_week,
+    on=["Store", "Dept", "Date"],
+    how="left",
+    validate="one_to_one"
+)
+
+display(
+    baseline_data[
+        ["Store", "Dept", "Date", "Weekly_Sales", "Last_Week_Sales"]
+    ].head()
+)
+
+"""## Baseline Validation Performance
+
+We evaluate the naive baseline using MAE, RMSE, and WAPE.
+Only observations with available previous-week sales are scored.
+
+This is rolling one-week-ahead evaluation: each prediction uses
+the preceding week's observed sales. It is not a forecast of all
+13 weeks made from one starting date. The test set remains unused.
+"""
+
+import numpy as np
+
+baseline_validation = baseline_data[
+    (baseline_data["Date"] >= validation_start)
+    & (baseline_data["Date"] < test_start)
+].copy()
+
+scored_validation = baseline_validation.dropna(
+    subset=["Last_Week_Sales"]
+)
+
+actual = scored_validation["Weekly_Sales"]
+predicted = scored_validation["Last_Week_Sales"]
+
+errors = actual - predicted
+
+mae = errors.abs().mean()
+rmse = np.sqrt((errors ** 2).mean())
+wape = errors.abs().sum() / actual.abs().sum() * 100
+
+print("Validation rows:", len(baseline_validation))
+print("Rows evaluated:", len(scored_validation))
+print("MAE:", round(mae, 2))
+print("RMSE:", round(rmse, 2))
+print("WAPE (%):", round(wape, 2))
+
+"""## Seasonal Naive Baseline
+
+Retail sales may repeat seasonal patterns. We create a baseline
+using sales from exactly 52 weeks earlier for the same store
+and department.
+
+A 52-week lag means 364 days, not the same calendar date last year.
+Some holidays may shift between weeks, so this baseline is approximate.
+"""
+
+previous_year = merged_data[
+    ["Store", "Dept", "Date", "Weekly_Sales"]
+].copy()
+
+previous_year = previous_year.rename(
+    columns={"Weekly_Sales": "Sales_52_Weeks_Ago"}
+)
+
+previous_year["Date"] = (
+    previous_year["Date"] + pd.Timedelta(weeks=52)
+)
+
+baseline_data = baseline_data.merge(
+    previous_year,
+    on=["Store", "Dept", "Date"],
+    how="left",
+    validate="one_to_one"
+)
+
+display(
+    baseline_data[
+        ["Store", "Dept", "Date", "Weekly_Sales", "Sales_52_Weeks_Ago"]
+    ].head()
+)
+
+"""## Comparing Forecasting Baselines
+
+We compare the last-week and seasonal baselines on the same
+validation observations.
+
+If the 52-week historical value is unavailable, the seasonal
+baseline falls back to last-week sales. We report how often
+this fallback is used. Test data remains unused.
+"""
+
+comparison_data = baseline_data[
+    (baseline_data["Date"] >= validation_start)
+    & (baseline_data["Date"] < test_start)
+    & baseline_data["Last_Week_Sales"].notna()
+].copy()
+
+fallback_count = comparison_data["Sales_52_Weeks_Ago"].isna().sum()
+
+comparison_data["Seasonal_Prediction"] = (
+    comparison_data["Sales_52_Weeks_Ago"]
+    .fillna(comparison_data["Last_Week_Sales"])
+)
+
+results = []
+
+for model_name, prediction_column in [
+    ("Last-week baseline", "Last_Week_Sales"),
+    ("Seasonal baseline", "Seasonal_Prediction")
+]:
+    actual = comparison_data["Weekly_Sales"]
+    predicted = comparison_data[prediction_column]
+    error = actual - predicted
+
+    results.append({
+        "Model": model_name,
+        "MAE": error.abs().mean(),
+        "RMSE": np.sqrt((error ** 2).mean()),
+        "WAPE_Percent": error.abs().sum() / actual.abs().sum() * 100
+    })
+
+baseline_results = pd.DataFrame(results)
+
+print("Seasonal fallback records:", fallback_count)
+display(baseline_results.round(2))
+
+"""## Visual Comparison of Baseline Predictions
+
+We plot weekly totals of actual sales and both baseline
+predictions over the validation period, using the same scored rows.
+
+This chart helps reveal overall tracking and missed peaks.
+Aggregated errors can cancel out, so the chart does not replace
+department-level error metrics.
+"""
+
+weekly_comparison = (
+    comparison_data.groupby("Date")[
+        ["Weekly_Sales", "Last_Week_Sales", "Seasonal_Prediction"]
+    ]
+    .sum()
+    .rename(columns={
+        "Weekly_Sales": "Actual",
+        "Last_Week_Sales": "Last-week baseline",
+        "Seasonal_Prediction": "Seasonal baseline"
+    })
+)
+
+(weekly_comparison / 1_000_000).plot(
+    figsize=(12, 5),
+    marker="o"
+)
+
+plt.title("Validation Period: Actual Sales vs Baselines")
+plt.xlabel("Week")
+plt.ylabel("Sales Amount (Millions)")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+"""## Anomaly Detection: Weekly Sales Changes
+
+We calculate the difference between current sales and sales
+exactly one week earlier for each store-department combination.
+
+Large changes may indicate unusual activity, holiday effects,
+promotions, returns, or data issues. They require investigation
+rather than automatic removal.
+"""
+
+baseline_data["Sales_Change"] = (
+    baseline_data["Weekly_Sales"]
+    - baseline_data["Last_Week_Sales"]
+)
+
+display(
+    baseline_data[
+        [
+            "Store", "Dept", "Date",
+            "Weekly_Sales", "Last_Week_Sales", "Sales_Change"
+        ]
+    ].head()
+)
+
+"""## Learning Typical Sales Changes
+
+For each store-department series, we calculate the median sales
+change and its Median Absolute Deviation (MAD) using training
+dates only.
+
+MAD measures variation around the median and is less sensitive
+to extreme values than standard deviation. Series with fewer
+than 20 valid changes or zero MAD will remain unscored.
+"""
+
+anomaly_training = baseline_data[
+    baseline_data["Date"] < validation_start
+].copy()
+
+change_stats = (
+    anomaly_training.groupby(["Store", "Dept"])["Sales_Change"]
+    .agg(
+        Valid_Changes="count",
+        Median_Change="median",
+        MAD=lambda values: (
+            values - values.median()
+        ).abs().median()
+    )
+    .reset_index()
+)
+
+display(change_stats.head())
+
+"""## Flagging Unusual Sales Changes
+
+We calculate a robust score using the training median and MAD.
+A scale factor of 1.4826 makes MAD comparable to standard
+deviation under a normal-distribution assumption.
+
+An absolute score above 5 is flagged for review. This threshold
+is an initial analytical choice, not a validated accuracy measure.
+Unscorable records remain separate, and no sales rows are deleted.
+Training-period flags are retrospective; later flags use frozen
+training statistics.
+"""
+
+anomaly_data = baseline_data.merge(
+    change_stats,
+    on=["Store", "Dept"],
+    how="left",
+    validate="many_to_one"
+)
+
+usable_history = (
+    (anomaly_data["Valid_Changes"] >= 20)
+    & (anomaly_data["MAD"] > 0)
+)
+
+scale = (1.4826 * anomaly_data["MAD"]).where(usable_history)
+
+anomaly_data["Anomaly_Score"] = (
+    (
+        anomaly_data["Sales_Change"]
+        - anomaly_data["Median_Change"]
+    ).abs()
+    / scale
+)
+
+anomaly_data["Anomaly_Status"] = np.where(
+    anomaly_data["Anomaly_Score"].isna(),
+    "Not scored",
+    np.where(
+        anomaly_data["Anomaly_Score"] > 5,
+        "Review",
+        "Within threshold"
+    )
+)
+
+print(anomaly_data["Anomaly_Status"].value_counts())
+
+display(
+    anomaly_data[
+        anomaly_data["Anomaly_Status"] == "Review"
+    ].nlargest(10, "Anomaly_Score")[
+        [
+            "Store", "Dept", "Date", "Weekly_Sales",
+            "Sales_Change", "IsHoliday", "Anomaly_Score"
+        ]
+    ]
+)
+
+"""## Investigating Anomalies Around Holidays
+
+We compare the percentage of scored records flagged for review
+during holiday and non-holiday weeks.
+
+Rates are more informative than raw counts because the two
+groups contain different numbers of observations. A higher rate
+does not prove that holidays caused the anomalies.
+"""
+
+scored_anomalies = anomaly_data[
+    anomaly_data["Anomaly_Status"] != "Not scored"
+].copy()
+
+scored_anomalies["Flagged"] = (
+    scored_anomalies["Anomaly_Status"] == "Review"
+)
+
+holiday_anomalies = (
+    scored_anomalies.groupby("IsHoliday")
+    .agg(
+        Scored_Records=("Flagged", "size"),
+        Flagged_Records=("Flagged", "sum"),
+        Flag_Rate_Percent=("Flagged", lambda values: values.mean() * 100)
+    )
+)
+
+display(holiday_anomalies.round(2))
+
+"""## Visual Review of Sales Anomalies
+
+We plot sales for Store 1, Department 1 and highlight records
+flagged by the weekly-change detector.
+
+The chart supports contextual review. A flagged point may be
+a genuine seasonal peak or a sharp decline after a peak.
+The detector measures changes, not just unusually high sales.
+"""
+
+example_series = anomaly_data[
+    (anomaly_data["Store"] == 1)
+    & (anomaly_data["Dept"] == 1)
+].sort_values("Date")
+
+flagged_points = example_series[
+    example_series["Anomaly_Status"] == "Review"
+]
+
+plt.figure(figsize=(12, 5))
+
+plt.plot(
+    example_series["Date"],
+    example_series["Weekly_Sales"],
+    label="Weekly sales",
+    color="teal"
+)
+
+plt.scatter(
+    flagged_points["Date"],
+    flagged_points["Weekly_Sales"],
+    color="red",
+    label="Flagged for review",
+    zorder=3
+)
+
+plt.axvline(
+    validation_start,
+    color="grey",
+    linestyle="--",
+    label="End of training period"
+)
+
+plt.title("Sales Anomaly Review: Store 1, Department 1")
+plt.xlabel("Week")
+plt.ylabel("Sales Amount")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+print("Flagged observations in this series:", len(flagged_points))
+
+"""## Anomaly Threshold Sensitivity
+
+We compare thresholds of 4, 5, and 6 on the same scored
+validation observations while keeping training statistics fixed.
+
+A lower threshold generally produces more alerts. This analysis
+helps assess review workload, but verified labels are needed
+to measure detection precision and recall. Test data is not
+used to select the threshold.
+"""
+
+validation_scores = anomaly_data.loc[
+    (anomaly_data["Date"] >= validation_start)
+    & (anomaly_data["Date"] < test_start),
+    "Anomaly_Score"
+].dropna()
+
+sensitivity_results = []
+
+for threshold in [4, 5, 6]:
+    flagged = validation_scores > threshold
+
+    sensitivity_results.append({
+        "Threshold": threshold,
+        "Scored_Records": len(validation_scores),
+        "Flagged_Records": int(flagged.sum()),
+        "Flag_Rate_Percent": flagged.mean() * 100
+    })
+
+sensitivity_table = pd.DataFrame(sensitivity_results)
+
+display(sensitivity_table.round(2))
+
+"""## Preparing Inputs for Isolation Forest
+
+Isolation Forest identifies observations with unusual combinations
+of sales, sales changes, store size, and external factors.
+
+We learn missing-value replacements from training data only and
+apply the same replacements to validation data. Original data
+remains unchanged.
+
+This is anomaly detection after sales are observed, not forecasting.
+Current-week sales are therefore valid inputs here.
+"""
+
+anomaly_features = [
+    "Weekly_Sales",
+    "Sales_Change",
+    "Temperature",
+    "Fuel_Price",
+    "CPI",
+    "Unemployment",
+    "Size"
+]
+
+iso_train = anomaly_data[
+    anomaly_data["Date"] < validation_start
+].copy()
+
+iso_validation = anomaly_data[
+    (anomaly_data["Date"] >= validation_start)
+    & (anomaly_data["Date"] < test_start)
+].copy()
+
+training_medians = iso_train[anomaly_features].median()
+
+X_anomaly_train = (
+    iso_train[anomaly_features].fillna(training_medians)
+)
+
+X_anomaly_validation = (
+    iso_validation[anomaly_features].fillna(training_medians)
+)
+
+print(
+    "Missing training inputs:",
+    X_anomaly_train.isna().sum().sum()
+)
+
+print(
+    "Missing validation inputs:",
+    X_anomaly_validation.isna().sum().sum()
+)
+
+"""## Isolation Forest Anomaly Detection
+
+We train an Isolation Forest on historical training observations
+and apply it to validation observations.
+
+The contamination setting of 0.01 sets the threshold using an
+assumed training anomaly proportion of approximately 1%.
+It is an analytical choice, not measured accuracy, and does not
+force the validation anomaly rate to equal 1%.
+"""
+
+from sklearn.ensemble import IsolationForest
+
+isolation_model = IsolationForest(
+    n_estimators=100,
+    contamination=0.01,
+    random_state=42,
+    n_jobs=2
+)
+
+isolation_model.fit(X_anomaly_train)
+
+iso_validation["Isolation_Flag"] = (
+    isolation_model.predict(X_anomaly_validation) == -1
+)
+
+iso_validation["Isolation_Score"] = (
+    -isolation_model.score_samples(X_anomaly_validation)
+)
+
+print(
+    "Validation records:",
+    len(iso_validation)
+)
+
+print(
+    "Isolation Forest flags:",
+    iso_validation["Isolation_Flag"].sum()
+)
+
+print(
+    "Validation flag rate (%):",
+    round(iso_validation["Isolation_Flag"].mean() * 100, 2)
+)
+
+"""## Comparing Anomaly Detection Methods
+
+We compare Isolation Forest flags with the earlier robust
+weekly-change flags on validation records that both methods
+can score.
+
+Agreement identifies cases for joint review. Disagreement is
+expected because the methods examine different patterns.
+Neither method is treated as ground truth.
+"""
+
+comparison_anomalies = iso_validation[
+    iso_validation["Anomaly_Status"] != "Not scored"
+].copy()
+
+comparison_anomalies["Robust_Flag"] = (
+    comparison_anomalies["Anomaly_Status"] == "Review"
+)
+
+agreement_table = pd.crosstab(
+    comparison_anomalies["Robust_Flag"],
+    comparison_anomalies["Isolation_Flag"],
+    rownames=["Robust method flagged"],
+    colnames=["Isolation Forest flagged"]
+).reindex(
+    index=[False, True],
+    columns=[False, True],
+    fill_value=0
+)
+
+display(agreement_table)
+
+display(
+    iso_validation.nlargest(10, "Isolation_Score")[
+        [
+            "Store",
+            "Dept",
+            "Date",
+            "Weekly_Sales",
+            "IsHoliday",
+            "Anomaly_Status",
+            "Isolation_Flag",
+            "Isolation_Score"
+        ]
+    ]
+)
+
+"""## Store Segmentation: Preparing Weekly Store Sales
+
+We aggregate department sales into total sales for each store
+and week, using training dates only.
+
+This gives each store-week one observation and avoids treating
+individual departments as separate stores.
+"""
+
+segmentation_weekly = (
+    train_data.groupby(
+        ["Store", "Date"],
+        as_index=False
+    )
+    .agg(
+        Store_Weekly_Sales=("Weekly_Sales", "sum"),
+        IsHoliday=("IsHoliday", "first")
+    )
+)
+
+print("Number of stores:", segmentation_weekly["Store"].nunique())
+
+display(segmentation_weekly.head())
+
+"""## Creating Store Profiles
+
+For each store, we calculate average weekly sales, sales
+variability, and the ratio of holiday to non-holiday average sales.
+
+We also add store size. These features describe sales level,
+stability, holiday patterns, and store scale. Holiday ratios
+are descriptive associations, not causal effects.
+"""
+
+store_profiles = (
+    segmentation_weekly.groupby("Store")
+    .agg(
+        Mean_Weekly_Sales=("Store_Weekly_Sales", "mean"),
+        Std_Weekly_Sales=("Store_Weekly_Sales", "std"),
+        Observed_Weeks=("Store_Weekly_Sales", "count")
+    )
+    .reset_index()
+)
+
+store_profiles["Sales_CV"] = (
+    store_profiles["Std_Weekly_Sales"]
+    / store_profiles["Mean_Weekly_Sales"].abs().replace(0, np.nan)
+)
+
+holiday_means = (
+    segmentation_weekly.groupby(
+        ["Store", "IsHoliday"]
+    )["Store_Weekly_Sales"]
+    .mean()
+    .unstack("IsHoliday")
+)
+
+holiday_ratio = (
+    holiday_means[True]
+    / holiday_means[False].replace(0, np.nan)
+)
+
+store_profiles["Holiday_Ratio"] = (
+    store_profiles["Store"].map(holiday_ratio)
+)
+
+store_profiles = store_profiles.merge(
+    stores,
+    on="Store",
+    how="left",
+    validate="one_to_one"
+)
+
+print("Store profile rows:", len(store_profiles))
+display(store_profiles.head().round(2))
+
+"""## Scaling Store Segmentation Features
+
+We standardize the numerical features before clustering.
+Sales and size have much larger numerical values than ratios,
+which could otherwise dominate distance calculations.
+
+StandardScaler centers each feature around zero and scales it
+to unit variance. Store IDs are excluded because they are
+identifiers, not numerical measures of similarity.
+"""
+
+from sklearn.preprocessing import StandardScaler
+
+cluster_features = [
+    "Mean_Weekly_Sales",
+    "Sales_CV",
+    "Holiday_Ratio",
+    "Size"
+]
+
+cluster_inputs = store_profiles[cluster_features].copy()
+
+print("Missing clustering inputs:")
+print(cluster_inputs.isna().sum())
+
+assert np.isfinite(cluster_inputs.to_numpy()).all(), (
+    "Missing or infinite values found. Investigate before clustering."
+)
+
+cluster_scaler = StandardScaler()
+
+scaled_store_features = cluster_scaler.fit_transform(
+    cluster_inputs
+)
+
+scaled_preview = pd.DataFrame(
+    scaled_store_features,
+    columns=cluster_features,
+    index=store_profiles["Store"]
+)
+
+display(scaled_preview.head().round(2))
+
+"""## Selecting the Number of Store Segments
+
+We compare K-Means solutions with two to six clusters using
+the standardized store profiles.
+
+Higher silhouette scores and lower Davies–Bouldin scores
+generally indicate better separation. We also examine cluster
+sizes because very small groups may be unstable or difficult
+to use in business decisions.
+"""
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+
+cluster_models = {}
+cluster_results = []
+
+for k in range(2, 7):
+    model = KMeans(
+        n_clusters=k,
+        n_init=20,
+        random_state=42
+    )
+
+    labels = model.fit_predict(scaled_store_features)
+
+    cluster_models[k] = model
+
+    cluster_results.append({
+        "Clusters": k,
+        "Silhouette": silhouette_score(
+            scaled_store_features, labels
+        ),
+        "Davies_Bouldin": davies_bouldin_score(
+            scaled_store_features, labels
+        ),
+        "Smallest_Cluster": pd.Series(labels).value_counts().min()
+    })
+
+cluster_quality = pd.DataFrame(cluster_results)
+
+display(cluster_quality.round(3))
+
+"""## Assigning Store Segments
+
+For this initial analysis, we select the candidate with the
+highest silhouette score and assign its cluster labels to stores.
+
+Cluster numbers are arbitrary identifiers, not performance
+rankings. The selected grouping still requires business
+interpretation and stability checks.
+"""
+
+best_k = int(
+    cluster_quality.sort_values(
+        "Silhouette", ascending=False
+    ).iloc[0]["Clusters"]
+)
+
+best_cluster_model = cluster_models[best_k]
+
+store_profiles["Segment"] = best_cluster_model.labels_
+
+print("Selected number of segments:", best_k)
+
+print("\nStores in each segment:")
+print(
+    store_profiles["Segment"]
+    .value_counts()
+    .sort_index()
+)
+
+display(
+    store_profiles[
+        ["Store", "Type", "Size", "Mean_Weekly_Sales", "Segment"]
+    ].head(10)
+)
+
+"""## Interpreting Store Segments
+
+We summarize each segment using original, unscaled values:
+average weekly sales, relative sales variability, holiday ratio,
+and store size.
+
+These summaries help describe the groups in business terms.
+Segment names and recommendations should follow the observed
+profiles rather than being assumed in advance.
+"""
+
+segment_summary = (
+    store_profiles.groupby("Segment")
+    .agg(
+        Stores=("Store", "count"),
+        Mean_Weekly_Sales=("Mean_Weekly_Sales", "mean"),
+        Mean_Sales_CV=("Sales_CV", "mean"),
+        Mean_Holiday_Ratio=("Holiday_Ratio", "mean"),
+        Mean_Size=("Size", "mean")
+    )
+)
+
+display(segment_summary.round(2))
+
+print("\nStore types within each segment:")
+
+display(
+    pd.crosstab(
+        store_profiles["Segment"],
+        store_profiles["Type"]
+    )
+)
+
+"""## Store Segment Findings
+
+The two-cluster solution achieved a silhouette score of 0.457
+and a Davies–Bouldin score of 0.822.
+
+Segment 0 contains 35 stores with higher average weekly sales
+and larger average size. Its average holiday/non-holiday sales
+ratio is approximately 1.10.
+
+Segment 1 contains 10 stores with lower average weekly sales,
+smaller average size, and lower relative sales variability.
+Its average holiday ratio is approximately 1.02.
+
+These are group averages, not characteristics shared equally
+by every store. Lower total sales do not establish poorer
+performance. The three-cluster solution has a similar silhouette
+score and remains a reasonable alternative for further review.
+"""
+
+segment_names = {
+    0: "Larger stores, higher sales",
+    1: "Smaller stores, lower variability"
+}
+
+store_profiles["Segment_Name"] = (
+    store_profiles["Segment"].map(segment_names)
+)
+
+display(
+    store_profiles[
+        ["Store", "Type", "Segment", "Segment_Name"]
+    ].head(10)
+)
+
+"""## Visualizing Store Segments
+
+We visualize stores using average weekly sales and relative
+sales variability, with colors indicating segment membership.
+
+Clustering used four features, while this chart shows only two.
+The plot therefore provides a partial view of the segmentation.
+"""
+
+plt.figure(figsize=(10, 6))
+
+for segment, group in store_profiles.groupby("Segment"):
+    plt.scatter(
+        group["Mean_Weekly_Sales"] / 1_000_000,
+        group["Sales_CV"],
+        label=segment_names[segment],
+        s=70,
+        alpha=0.8
+    )
+
+plt.title("Store Segments: Sales Level and Variability")
+plt.xlabel("Mean Weekly Store Sales (Millions)")
+plt.ylabel("Sales Coefficient of Variation")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+
+plt.savefig(
+    output_folder / "store_segments.png",
+    dpi=150,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+"""## Saving Segmentation Results
+
+We save store assignments, segment summaries, and clustering
+quality metrics for reporting and later business analysis.
+
+These files preserve the current segmentation results.
+"""
+
+store_profiles.to_csv(
+    output_folder / "store_segments.csv",
+    index=False
+)
+
+segment_summary.reset_index().to_csv(
+    output_folder / "segment_summary.csv",
+    index=False
+)
+
+cluster_quality.to_csv(
+    output_folder / "cluster_quality.csv",
+    index=False
+)
+
+print("Saved: store_segments.csv")
+print("Saved: segment_summary.csv")
+print("Saved: cluster_quality.csv")
+print("Saved chart: store_segments.png")
+
+"""## Preparing Store-Level Context Features
+
+We use one record per store-week to summarize markdowns and
+external factors during the training period.
+
+This avoids counting the same store-week information repeatedly
+across departments. Missing markdowns remain unknown and are
+not replaced with zero.
+"""
+
+context_columns = [
+    "Store", "Date",
+    "Temperature", "Fuel_Price", "CPI", "Unemployment",
+    "MarkDown1", "MarkDown2", "MarkDown3",
+    "MarkDown4", "MarkDown5"
+]
+
+store_week_context = (
+    train_data[context_columns]
+    .drop_duplicates(subset=["Store", "Date"])
+    .copy()
+)
+
+store_week_context["Markdown_Availability"] = (
+    store_week_context[markdown_columns]
+    .notna()
+    .mean(axis=1)
+)
+
+print("Stores:", store_week_context["Store"].nunique())
+
+print(
+    "Repeated store-week keys:",
+    store_week_context.duplicated(["Store", "Date"]).sum()
+)
+
+display(store_week_context.head())
+
+"""## Summarizing External Factors by Store
+
+We calculate each store's average external indicators and
+markdown data availability during training.
+
+Markdown means use only recorded values. They should not be
+interpreted as average spending across all weeks, because
+missing observations are excluded.
+"""
+
+store_context = (
+    store_week_context.groupby("Store")
+    .agg(
+        Mean_Temperature=("Temperature", "mean"),
+        Mean_Fuel_Price=("Fuel_Price", "mean"),
+        Mean_CPI=("CPI", "mean"),
+        Mean_Unemployment=("Unemployment", "mean"),
+        Markdown_Availability=("Markdown_Availability", "mean"),
+        Mean_Recorded_MarkDown1=("MarkDown1", "mean")
+    )
+    .reset_index()
+)
+
+store_context = store_context.merge(
+    store_profiles[["Store", "Segment", "Segment_Name"]],
+    on="Store",
+    how="left",
+    validate="one_to_one"
+)
+
+assert store_context["Segment"].notna().all()
+
+display(store_context.head().round(2))
+
+"""## Comparing Segment Context
+
+We compare average store-level external indicators and markdown
+availability across the existing segments. Each store receives
+equal weight in these segment averages.
+
+These differences are descriptive. They do not establish regional
+identities, promotion responsiveness, or causal economic effects.
+Store locations and customer-level data are unavailable.
+"""
+
+segment_context = (
+    store_context.groupby("Segment_Name")
+    .agg(
+        Stores=("Store", "count"),
+        Mean_Temperature=("Mean_Temperature", "mean"),
+        Mean_Fuel_Price=("Mean_Fuel_Price", "mean"),
+        Mean_CPI=("Mean_CPI", "mean"),
+        Mean_Unemployment=("Mean_Unemployment", "mean"),
+        Markdown_Availability=("Markdown_Availability", "mean"),
+        Mean_Recorded_MarkDown1=("Mean_Recorded_MarkDown1", "mean")
+    )
+)
+
+segment_context["Markdown_Availability_Percent"] = (
+    segment_context.pop("Markdown_Availability") * 100
+)
+
+display(segment_context.round(2))
+
+segment_context.reset_index().to_csv(
+    output_folder / "segment_context.csv",
+    index=False
+)
+
+print("Saved: segment_context.csv")
+
+"""## Department Association Analysis: Defining Sales Events
+
+Actual transaction baskets are unavailable. We therefore explore
+department-level sales events as a limited proxy.
+
+A strong-sales event occurs when sales exceed the same department's
+sales 52 weeks earlier by more than 20%. We use non-holiday training
+weeks with a positive seasonal reference.
+
+The threshold is an analytical choice. Shared trends and promotions
+may still influence the associations.
+"""
+
+association_data = baseline_data[
+    (baseline_data["Date"] < validation_start)
+    & (~baseline_data["IsHoliday"])
+    & (baseline_data["Sales_52_Weeks_Ago"] > 0)
+].copy()
+
+association_data["Strong_Sales_Event"] = (
+    association_data["Weekly_Sales"]
+    > 1.20 * association_data["Sales_52_Weeks_Ago"]
+).astype(int)
+
+display(
+    association_data[
+        [
+            "Store", "Dept", "Date",
+            "Weekly_Sales", "Sales_52_Weeks_Ago",
+            "Strong_Sales_Event"
+        ]
+    ].head()
+)
+
+print("Eligible department-week records:", len(association_data))
+
+"""## Building the Department Event Matrix
+
+We create a matrix with one row per store-week and one column
+per department.
+
+A value of 1 indicates a strong-sales event, and 0 indicates an
+eligible observation without that event. Missing values represent
+unavailable or ineligible observations and are not filled with zero.
+"""
+
+event_matrix = association_data.pivot(
+    index=["Store", "Date"],
+    columns="Dept",
+    values="Strong_Sales_Event"
+)
+
+print("Event matrix shape:", event_matrix.shape)
+
+display(event_matrix.iloc[:5, :8])
+
+"""## Calculating Department Association Rules
+
+For each department pair, we calculate rules in both directions.
+We require at least 200 jointly observed store-weeks and at least
+20 joint strong-sales events.
+
+Support measures joint-event frequency. Confidence measures the
+frequency of the consequent event when the antecedent event occurs.
+Lift compares confidence with the consequent's baseline event rate.
+
+These thresholds are exploratory screening choices. Pairwise
+coverage differs, and high lift alone does not establish a reliable
+cross-selling opportunity.
+"""
+
+from itertools import combinations
+
+rules = []
+
+for dept_a, dept_b in combinations(event_matrix.columns, 2):
+    pair = event_matrix[[dept_a, dept_b]].dropna()
+
+    n = len(pair)
+
+    if n < 200:
+        continue
+
+    count_a = int(pair[dept_a].sum())
+    count_b = int(pair[dept_b].sum())
+
+    joint_count = int(
+        ((pair[dept_a] == 1) & (pair[dept_b] == 1)).sum()
+    )
+
+    if joint_count < 20:
+        continue
+
+    for source, target, source_count, target_count in [
+        (dept_a, dept_b, count_a, count_b),
+        (dept_b, dept_a, count_b, count_a)
+    ]:
+        support = joint_count / n
+        confidence = joint_count / source_count
+        lift = confidence / (target_count / n)
+
+        rules.append({
+            "From_Dept": source,
+            "To_Dept": target,
+            "Eligible_Weeks": n,
+            "Joint_Events": joint_count,
+            "Support": support,
+            "Confidence": confidence,
+            "Lift": lift
+        })
+
+association_rules = pd.DataFrame(
+    rules,
+    columns=[
+        "From_Dept", "To_Dept", "Eligible_Weeks",
+        "Joint_Events", "Support", "Confidence", "Lift"
+    ]
+).sort_values(
+    ["Lift", "Joint_Events"],
+    ascending=False
+)
+
+print("Rules found:", len(association_rules))
+
+display(association_rules.head(10).round(3))
+
+association_rules.to_csv(
+    output_folder / "department_association_rules.csv",
+    index=False
+)
+
+"""## Validating Department Associations
+
+We apply the same strong-sales definition to non-holiday
+validation weeks: sales more than 20% above the 52-week reference.
+
+The event definition remains unchanged. We use validation data
+to assess whether training associations persist in later weeks.
+Test data remains unused.
+"""
+
+association_validation = baseline_data[
+    (baseline_data["Date"] >= validation_start)
+    & (baseline_data["Date"] < test_start)
+    & (~baseline_data["IsHoliday"])
+    & (baseline_data["Sales_52_Weeks_Ago"] > 0)
+].copy()
+
+association_validation["Strong_Sales_Event"] = (
+    association_validation["Weekly_Sales"]
+    > 1.20 * association_validation["Sales_52_Weeks_Ago"]
+).astype(int)
+
+validation_events = association_validation.pivot(
+    index=["Store", "Date"],
+    columns="Dept",
+    values="Strong_Sales_Event"
+)
+
+print("Validation event matrix shape:", validation_events.shape)
+display(validation_events.iloc[:5, :8])
+
+"""## Checking Previously Selected Rules
+
+We evaluate the ten highest-ranked training rules without
+selecting new rules from validation results.
+
+For each rule, we report eligible observations, source events,
+joint events, confidence, and lift. Undefined metrics remain
+missing rather than being reported as zero.
+"""
+
+rule_validation_results = []
+
+for _, rule in association_rules.head(10).iterrows():
+    source = int(rule["From_Dept"])
+    target = int(rule["To_Dept"])
+
+    pair = validation_events.reindex(
+        columns=[source, target]
+    ).dropna()
+
+    n = len(pair)
+    source_count = int(pair[source].sum())
+    target_count = int(pair[target].sum())
+
+    joint_count = int(
+        ((pair[source] == 1) & (pair[target] == 1)).sum()
+    )
+
+    confidence = (
+        joint_count / source_count
+        if source_count > 0 else np.nan
+    )
+
+    target_rate = target_count / n if n > 0 else np.nan
+
+    lift = (
+        confidence / target_rate
+        if target_rate > 0 else np.nan
+    )
+
+    rule_validation_results.append({
+        "From_Dept": source,
+        "To_Dept": target,
+        "Training_Lift": rule["Lift"],
+        "Validation_Weeks": n,
+        "Source_Events": source_count,
+        "Joint_Events": joint_count,
+        "Validation_Confidence": confidence,
+        "Validation_Lift": lift
+    })
+
+rule_validation = pd.DataFrame(rule_validation_results)
+
+display(rule_validation.round(3))
+
+"""## Screening Associations for Further Review
+
+We flag exploratory review candidates with validation lift above
+1, at least 100 eligible store-weeks, 10 source events, and 5 joint
+events.
+
+These are practical screening thresholds, not statistical
+significance tests. Candidate rules require further validation
+and transaction-level evidence before cross-selling decisions.
+"""
+
+rule_validation["Candidate_For_Review"] = (
+    (rule_validation["Validation_Weeks"] >= 100)
+    & (rule_validation["Source_Events"] >= 10)
+    & (rule_validation["Joint_Events"] >= 5)
+    & (rule_validation["Validation_Lift"] > 1)
+)
+
+display(
+    rule_validation[
+        [
+            "From_Dept",
+            "To_Dept",
+            "Training_Lift",
+            "Validation_Lift",
+            "Joint_Events",
+            "Candidate_For_Review"
+        ]
+    ].round(3)
+)
+
+rule_validation.to_csv(
+    output_folder / "association_validation.csv",
+    index=False
+)
+
+print(
+    "Candidates for further review:",
+    int(rule_validation["Candidate_For_Review"].sum())
+)
+
+print("Saved: association_validation.csv")
+
+"""## Forecasting Features: Historical Sales Lags
+
+We add sales observed exactly 2, 4, and 8 weeks before each
+target week. Existing features already contain 1-week and
+52-week historical sales.
+
+Exact date joins preserve the meaning of each lag when a series
+has missing weeks. Unavailable history remains missing.
+"""
+
+model_data = baseline_data.copy()
+
+for weeks in [2, 4, 8]:
+    lag_column = f"Sales_Lag_{weeks}"
+
+    history = merged_data[
+        ["Store", "Dept", "Date", "Weekly_Sales"]
+    ].copy()
+
+    history = history.rename(
+        columns={"Weekly_Sales": lag_column}
+    )
+
+    history["Date"] = (
+        history["Date"] + pd.Timedelta(weeks=weeks)
+    )
+
+    model_data = model_data.merge(
+        history,
+        on=["Store", "Dept", "Date"],
+        how="left",
+        validate="one_to_one"
+    )
+
+display(
+    model_data[
+        [
+            "Store", "Dept", "Date", "Weekly_Sales",
+            "Last_Week_Sales", "Sales_Lag_2",
+            "Sales_Lag_4", "Sales_Lag_8"
+        ]
+    ].head(10)
+)
+
+"""## Summarizing Recent Sales History
+
+We calculate the mean and standard deviation of available sales
+lags at 1, 2, 4, and 8 weeks.
+
+These are summaries of selected historical weeks, not a continuous
+four-week rolling window. We record how many lag values are
+available so incomplete history remains visible.
+"""
+
+recent_lag_columns = [
+    "Last_Week_Sales",
+    "Sales_Lag_2",
+    "Sales_Lag_4",
+    "Sales_Lag_8"
+]
+
+model_data["Recent_Sales_Mean"] = (
+    model_data[recent_lag_columns].mean(axis=1)
+)
+
+model_data["Recent_Sales_Std"] = (
+    model_data[recent_lag_columns].std(axis=1)
+)
+
+model_data["Available_Recent_Lags"] = (
+    model_data[recent_lag_columns].notna().sum(axis=1)
+)
+
+display(
+    model_data[
+        [
+            "Date",
+            "Recent_Sales_Mean",
+            "Recent_Sales_Std",
+            "Available_Recent_Lags"
+        ]
+    ].head(10)
+)
+
+"""## Selecting Leakage-Safe Core Model Inputs
+
+The core model uses store identifiers, store attributes, known
+calendar information, and historical sales features.
+
+Store, department, and type are categorical variables.
+Current-week sales, sales changes, and anomaly scores are excluded
+because they contain information unavailable before the target
+week's sales are observed.
+
+Current-week external measurements and markdowns are also excluded
+from this initial model. Their past values will be considered later.
+"""
+
+categorical_features = ["Store", "Dept", "Type"]
+
+numeric_features = [
+    "Size",
+    "Year",
+    "Month",
+    "WeekOfYear",
+    "Quarter",
+    "IsHoliday",
+    "Last_Week_Sales",
+    "Sales_52_Weeks_Ago",
+    "Sales_Lag_2",
+    "Sales_Lag_4",
+    "Sales_Lag_8",
+    "Recent_Sales_Mean",
+    "Recent_Sales_Std",
+    "Available_Recent_Lags"
+]
+
+forecast_features = categorical_features + numeric_features
+
+X_train = model_data.loc[
+    model_data["Date"] < validation_start,
+    forecast_features
+].copy()
+
+y_train = model_data.loc[
+    model_data["Date"] < validation_start,
+    "Weekly_Sales"
+].copy()
+
+X_validation = model_data.loc[
+    (model_data["Date"] >= validation_start)
+    & (model_data["Date"] < test_start),
+    forecast_features
+].copy()
+
+y_validation = model_data.loc[
+    (model_data["Date"] >= validation_start)
+    & (model_data["Date"] < test_start),
+    "Weekly_Sales"
+].copy()
+
+print("Number of input features:", len(forecast_features))
+print("Training inputs:", X_train.shape)
+print("Validation inputs:", X_validation.shape)
+
+assert X_train.index.equals(y_train.index)
+assert X_validation.index.equals(y_validation.index)
+
+print("Input and target rows are aligned.")
+
+"""## Forecasting Preprocessing Pipeline
+
+Numerical missing values are replaced with medians learned
+from training data, with missingness indicators added.
+
+Store, department, and type are encoded as categorical values.
+Unseen categories receive a separate unknown code.
+
+Preprocessing is fitted only on training data and then applied
+unchanged to validation data.
+"""
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.pipeline import Pipeline
+
+numeric_preprocessor = SimpleImputer(
+    strategy="median",
+    add_indicator=True,
+    keep_empty_features=True
+)
+
+categorical_preprocessor = OrdinalEncoder(
+    handle_unknown="use_encoded_value",
+    unknown_value=-1
+)
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("categories", categorical_preprocessor, categorical_features),
+        ("numbers", numeric_preprocessor, numeric_features)
+    ],
+    remainder="drop"
+)
+
+print("Preprocessing pipeline is ready.")
+
+"""## Training the Core Forecasting Model
+
+We train a histogram-based gradient boosting regressor using
+the preprocessing pipeline.
+
+The first three transformed columns are treated as categorical
+features, so their encoded numbers do not imply numerical order.
+
+We use fixed initial hyperparameters and disable internal random
+early-stopping splits to preserve our chronological evaluation.
+"""
+
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+forecast_model = Pipeline(
+    steps=[
+        ("preprocessing", preprocessor),
+        (
+            "regression",
+            HistGradientBoostingRegressor(
+                max_iter=100,
+                learning_rate=0.08,
+                max_leaf_nodes=31,
+                l2_regularization=10,
+                categorical_features=[0, 1, 2],
+                early_stopping=False,
+                random_state=42
+            )
+        )
+    ]
+)
+
+forecast_model.fit(X_train, y_train)
+
+print("Core forecasting model trained successfully.")
+
+"""## Evaluating the Core Forecasting Model
+
+We predict validation sales and compare the model with both
+baselines on exactly the same observations used earlier.
+
+This comparison excludes validation rows without last-week sales
+to maintain equal baseline coverage. Evaluation remains rolling
+one week ahead; the test set is still untouched.
+"""
+
+validation_predictions = pd.Series(
+    forecast_model.predict(X_validation),
+    index=X_validation.index,
+    name="Core_Prediction"
+)
+
+# Use the same validation records as the baseline comparison.
+evaluation_mask = X_validation["Last_Week_Sales"].notna()
+
+actual = y_validation.loc[evaluation_mask]
+predicted = validation_predictions.loc[evaluation_mask]
+
+error = actual - predicted
+
+core_result = pd.DataFrame([{
+    "Model": "Core gradient boosting",
+    "MAE": error.abs().mean(),
+    "RMSE": np.sqrt((error ** 2).mean()),
+    "WAPE_Percent": error.abs().sum() / actual.abs().sum() * 100
+}])
+
+assert len(actual) == len(comparison_data)
+
+model_comparison = pd.concat(
+    [baseline_results, core_result],
+    ignore_index=True
+)
+
+display(model_comparison.round(2))
+
+model_comparison.to_csv(
+    output_folder / "validation_model_comparison.csv",
+    index=False
+)
+
+print("Saved: validation_model_comparison.csv")
+
+"""## Adding Historical External Factors
+
+We add previous-week temperature, fuel price, CPI, unemployment,
+and markdown values to the forecasting inputs.
+
+We do not use actual external measurements from the target week,
+because those values may be unavailable when forecasting.
+This analysis assumes previous-week records are available at
+the forecast origin; real publication delays must be checked
+before deployment.
+"""
+
+external_columns = [
+    "Temperature",
+    "Fuel_Price",
+    "CPI",
+    "Unemployment",
+    "MarkDown1",
+    "MarkDown2",
+    "MarkDown3",
+    "MarkDown4",
+    "MarkDown5"
+]
+
+external_history = features[
+    ["Store", "Date"] + external_columns
+].copy()
+
+external_history["Date"] = (
+    external_history["Date"] + pd.Timedelta(weeks=1)
+)
+
+external_history = external_history.rename(
+    columns={
+        column: column + "_Lag1"
+        for column in external_columns
+    }
+)
+
+external_data = model_data.join(
+    external_history.set_index(["Store", "Date"]),
+    on=["Store", "Date"],
+    how="left",
+    validate="many_to_one"
+)
+
+assert external_data.index.equals(model_data.index)
+assert len(external_data) == len(model_data)
+
+display(
+    external_data[
+        [
+            "Store", "Date",
+            "Temperature_Lag1",
+            "CPI_Lag1",
+            "MarkDown1_Lag1"
+        ]
+    ].head()
+)
+
+"""## Training the External-Feature Forecasting Model
+
+We train a second model with the same regression settings and
+additional lagged external inputs.
+
+A separate preprocessing pipeline learns its replacements and
+encodings from training data only. The original core model
+remains unchanged, allowing a controlled feature-set comparison.
+"""
+
+from sklearn.base import clone
+
+external_lag_features = [
+    column + "_Lag1"
+    for column in external_columns
+]
+
+extended_numeric_features = (
+    numeric_features + external_lag_features
+)
+
+extended_features = (
+    categorical_features + extended_numeric_features
+)
+
+X_train_external = external_data.loc[
+    X_train.index,
+    extended_features
+].copy()
+
+X_validation_external = external_data.loc[
+    X_validation.index,
+    extended_features
+].copy()
+
+external_preprocessor = ColumnTransformer(
+    transformers=[
+        (
+            "categories",
+            clone(categorical_preprocessor),
+            categorical_features
+        ),
+        (
+            "numbers",
+            clone(numeric_preprocessor),
+            extended_numeric_features
+        )
+    ],
+    remainder="drop"
+)
+
+external_model = Pipeline(
+    steps=[
+        ("preprocessing", external_preprocessor),
+        (
+            "regression",
+            clone(forecast_model.named_steps["regression"])
+        )
+    ]
+)
+
+external_model.fit(X_train_external, y_train)
+
+print("Input features:", len(extended_features))
+print("External-feature model trained successfully.")
+
+"""## Measuring the Contribution of External Features
+
+We evaluate both models on the same validation observations.
+The percentage change in MAE measures whether adding the
+lagged external features improves forecasting in this period.
+
+Improvement indicates predictive usefulness, not proof that
+an external factor causes sales changes.
+"""
+
+external_predictions = pd.Series(
+    external_model.predict(X_validation_external),
+    index=X_validation_external.index
+)
+
+common_index = X_validation.index[
+    X_validation["Last_Week_Sales"].notna()
+]
+
+actual = y_validation.loc[common_index]
+predicted = external_predictions.loc[common_index]
+
+error = actual - predicted
+
+external_result = pd.DataFrame([{
+    "Model": "Boosting with external features",
+    "MAE": error.abs().mean(),
+    "RMSE": np.sqrt((error ** 2).mean()),
+    "WAPE_Percent": error.abs().sum() / actual.abs().sum() * 100
+}])
+
+full_model_comparison = pd.concat(
+    [model_comparison, external_result],
+    ignore_index=True
+)
+
+display(full_model_comparison.round(2))
+
+core_mae = core_result.iloc[0]["MAE"]
+external_mae = external_result.iloc[0]["MAE"]
+
+improvement = (
+    (core_mae - external_mae) / core_mae * 100
+)
+
+print(
+    "MAE improvement from external features (%):",
+    round(improvement, 2)
+)
+
+full_model_comparison.to_csv(
+    output_folder / "external_feature_comparison.csv",
+    index=False
+)
+
+"""## Selecting and Refitting the Final One-Week Model
+
+The core model achieved the lowest validation MAE among the
+tested candidates. Adding lagged external features increased
+validation MAE by approximately 2.93%.
+
+We freeze the core model settings and refit a fresh pipeline
+using all observations before the test period. Test outcomes
+are not used for model selection or fitting.
+"""
+
+final_training_data = model_data[
+    model_data["Date"] < test_start
+].copy()
+
+test_model_data = model_data[
+    model_data["Date"] >= test_start
+].copy()
+
+X_final_train = final_training_data[forecast_features]
+y_final_train = final_training_data["Weekly_Sales"]
+
+X_test_core = test_model_data[forecast_features]
+
+assert (
+    final_training_data["Date"].max()
+    <= test_model_data["Date"].min() - pd.Timedelta(weeks=1)
+)
+
+final_core_model = clone(forecast_model)
+
+final_core_model.fit(X_final_train, y_final_train)
+
+print("Selected model: Core gradient boosting")
+print("Training ends:", final_training_data["Date"].max().date())
+print("Test starts:", test_model_data["Date"].min().date())
+
+"""## Final One-Week-Ahead Test Evaluation
+
+We evaluate the frozen model and both baselines on the same
+test observations with available previous-week sales.
+
+This is rolling one-week-ahead evaluation. Earlier test weeks'
+observed sales become available as inputs for later predictions,
+but model parameters remain fixed.
+
+The seasonal baseline falls back to previous-week sales when
+52-week history is unavailable. Test results will be reported
+without using them to retune the model.
+"""
+
+test_results = test_model_data[
+    [
+        "Store", "Dept", "Date", "Weekly_Sales",
+        "Last_Week_Sales", "Sales_52_Weeks_Ago"
+    ]
+].copy()
+
+test_results["Core_Prediction"] = (
+    final_core_model.predict(X_test_core)
+)
+
+test_results["Seasonal_Prediction"] = (
+    test_results["Sales_52_Weeks_Ago"]
+    .fillna(test_results["Last_Week_Sales"])
+)
+
+test_scored = test_results.dropna(
+    subset=["Last_Week_Sales"]
+).copy()
+
+test_metric_rows = []
+
+for name, column in [
+    ("Last-week baseline", "Last_Week_Sales"),
+    ("Seasonal baseline", "Seasonal_Prediction"),
+    ("Selected core model", "Core_Prediction")
+]:
+    actual = test_scored["Weekly_Sales"]
+    error = actual - test_scored[column]
+
+    test_metric_rows.append({
+        "Model": name,
+        "MAE": error.abs().mean(),
+        "RMSE": np.sqrt((error ** 2).mean()),
+        "WAPE_Percent": error.abs().sum() / actual.abs().sum() * 100
+    })
+
+test_metrics = pd.DataFrame(test_metric_rows)
+
+print("Total test observations:", len(test_results))
+print("Observations used for comparison:", len(test_scored))
+
+display(test_metrics.round(2))
+
+"""## Visualizing and Saving Test Results
+
+We plot weekly totals of actual and predicted sales over the
+same scored test observations and save the detailed results.
+
+The aggregate chart shows overall tracking but can hide
+offsetting department-level errors. Therefore, it is interpreted
+alongside the numerical evaluation metrics.
+"""
+
+test_weekly_plot = (
+    test_scored.groupby("Date")[
+        ["Weekly_Sales", "Core_Prediction"]
+    ]
+    .sum()
+    .rename(columns={
+        "Weekly_Sales": "Actual sales",
+        "Core_Prediction": "Predicted sales"
+    })
+)
+
+(test_weekly_plot / 1_000_000).plot(
+    figsize=(12, 5),
+    marker="o"
+)
+
+plt.title("One-Week-Ahead Test: Actual vs Predicted Sales")
+plt.xlabel("Target Week")
+plt.ylabel("Sales Amount (Millions)")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+
+plt.savefig(
+    output_folder / "one_week_test_forecast.png",
+    dpi=150,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+test_metrics.to_csv(
+    output_folder / "one_week_test_metrics.csv",
+    index=False
+)
+
+test_results.to_csv(
+    output_folder / "one_week_test_predictions.csv",
+    index=False
+)
+
+print("Saved test metrics, predictions, and chart.")
+
+"""## One-Week Forecasting Findings and Coverage
+
+The selected core model achieved a test MAE of 1276.44,
+RMSE of 2652.42, and WAPE of 8.06% on the common comparison
+sample. Its MAE was approximately 16.3% lower than the
+last-week baseline.
+
+The comparison covered 38,009 of 38,530 test observations.
+The remaining 521 observations lacked previous-week sales.
+
+We additionally report model-only performance on all test
+observations and on the excluded subset. These results use
+different samples and must not be directly compared with
+the common-sample baseline metrics.
+"""
+
+coverage_results = []
+
+coverage_groups = [
+    ("All test observations", test_results),
+    (
+        "Missing previous-week sales",
+        test_results[test_results["Last_Week_Sales"].isna()]
+    )
+]
+
+for name, subset in coverage_groups:
+    actual = subset["Weekly_Sales"]
+    error = subset["Core_Prediction"] - actual
+    denominator = actual.abs().sum()
+
+    coverage_results.append({
+        "Sample": name,
+        "Records": len(subset),
+        "MAE": error.abs().mean(),
+        "RMSE": np.sqrt((error ** 2).mean()),
+        "WAPE_Percent": (
+            error.abs().sum() / denominator * 100
+            if denominator > 0 else np.nan
+        )
+    })
+
+coverage_metrics = pd.DataFrame(coverage_results)
+
+display(coverage_metrics.round(2))
+
+"""## Store-Level Forecast Errors
+
+We calculate store-level metrics on the common test sample
+to identify differences hidden by the overall score.
+
+Bias is defined as predicted minus actual sales, normalized
+by total absolute actual sales. Positive bias indicates net
+overprediction; negative bias indicates net underprediction.
+
+These diagnostics support review and do not change the frozen model.
+"""
+
+store_error_rows = []
+
+for store, group in test_scored.groupby("Store"):
+    actual = group["Weekly_Sales"]
+    error = group["Core_Prediction"] - actual
+    denominator = actual.abs().sum()
+
+    store_error_rows.append({
+        "Store": store,
+        "Records": len(group),
+        "MAE": error.abs().mean(),
+        "RMSE": np.sqrt((error ** 2).mean()),
+        "WAPE_Percent": (
+            error.abs().sum() / denominator * 100
+            if denominator > 0 else np.nan
+        ),
+        "Bias_Percent": (
+            error.sum() / denominator * 100
+            if denominator > 0 else np.nan
+        )
+    })
+
+store_errors = pd.DataFrame(store_error_rows)
+
+display(
+    store_errors.sort_values(
+        "WAPE_Percent",
+        ascending=False
+    ).head(10).round(2)
+)
+
+"""## Visualizing Store-Level Forecast Error
+
+We visualize the ten stores with the highest test WAPE
+and save the coverage and store-level diagnostics.
+
+Higher errors identify forecasting review priorities, not
+necessarily poorly managed or unprofitable stores.
+"""
+
+highest_error_stores = (
+    store_errors.nlargest(10, "WAPE_Percent")
+    .sort_values("WAPE_Percent")
+)
+
+plt.figure(figsize=(10, 5))
+
+plt.barh(
+    highest_error_stores["Store"].astype(str),
+    highest_error_stores["WAPE_Percent"],
+    color="darkorange"
+)
+
+plt.title("Ten Stores with Highest Test Forecast WAPE")
+plt.xlabel("WAPE (%)")
+plt.ylabel("Store ID")
+plt.tight_layout()
+
+plt.savefig(
+    output_folder / "store_forecast_errors.png",
+    dpi=150,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+store_errors.to_csv(
+    output_folder / "store_forecast_errors.csv",
+    index=False
+)
+
+coverage_metrics.to_csv(
+    output_folder / "forecast_coverage_metrics.csv",
+    index=False
+)
+
+print("Saved coverage metrics, store errors, and chart.")
+
+"""## Preparing a Direct 13-Week Forecast
+
+We define a forecast origin as the week whose sales have already
+been observed. The target is sales exactly 13 weeks later for
+the same store and department.
+
+Origin sales are valid inputs because they are known when the
+forecast is made. Target sales are used only as the outcome to
+learn or evaluate, never as an input.
+"""
+
+forecast_horizon = 13
+
+horizon_data = model_data.rename(
+    columns={
+        "Date": "Origin_Date",
+        "Weekly_Sales": "Origin_Sales"
+    }
+).copy()
+
+horizon_data["Target_Date"] = (
+    horizon_data["Origin_Date"]
+    + pd.Timedelta(weeks=forecast_horizon)
+)
+
+future_targets = sales[
+    ["Store", "Dept", "Date", "Weekly_Sales"]
+].rename(
+    columns={
+        "Date": "Target_Date",
+        "Weekly_Sales": "Target_Sales"
+    }
+)
+
+horizon_data = horizon_data.merge(
+    future_targets,
+    on=["Store", "Dept", "Target_Date"],
+    how="left",
+    validate="one_to_one"
+)
+
+display(
+    horizon_data[
+        [
+            "Store", "Dept", "Origin_Date",
+            "Origin_Sales", "Target_Date", "Target_Sales"
+        ]
+    ].head()
+)
+
+"""## Target Calendar Features and Seasonal Reference
+
+We create calendar features for the target week. Holiday flags
+are treated as calendar information known at the forecast origin.
+
+The seasonal baseline uses sales 52 weeks before the target date.
+For a 13-week horizon, this reference is 39 weeks before the origin,
+so it is historical information.
+
+If that reference is unavailable, the baseline uses origin sales.
+Actual future weather, economic indicators, and markdowns are excluded.
+"""
+
+horizon_data["Target_Year"] = (
+    horizon_data["Target_Date"].dt.year
+)
+horizon_data["Target_Month"] = (
+    horizon_data["Target_Date"].dt.month
+)
+horizon_data["Target_Week"] = (
+    horizon_data["Target_Date"].dt.isocalendar().week.astype(int)
+)
+horizon_data["Target_Quarter"] = (
+    horizon_data["Target_Date"].dt.quarter
+)
+
+target_calendar = features[
+    ["Store", "Date", "IsHoliday"]
+].rename(
+    columns={
+        "Date": "Target_Date",
+        "IsHoliday": "Target_IsHoliday"
+    }
+)
+
+horizon_data = horizon_data.merge(
+    target_calendar,
+    on=["Store", "Target_Date"],
+    how="left",
+    validate="many_to_one"
+)
+
+seasonal_reference = sales[
+    ["Store", "Dept", "Date", "Weekly_Sales"]
+].rename(
+    columns={
+        "Date": "Target_Date",
+        "Weekly_Sales": "Target_Seasonal_Sales"
+    }
+)
+
+seasonal_reference["Target_Date"] += pd.Timedelta(weeks=52)
+
+horizon_data = horizon_data.merge(
+    seasonal_reference,
+    on=["Store", "Dept", "Target_Date"],
+    how="left",
+    validate="one_to_one"
+)
+
+horizon_data["Seasonal_Baseline_13W"] = (
+    horizon_data["Target_Seasonal_Sales"]
+    .fillna(horizon_data["Origin_Sales"])
+)
+
+display(
+    horizon_data[
+        [
+            "Origin_Date", "Target_Date",
+            "Target_Month", "Target_Week",
+            "Target_IsHoliday", "Seasonal_Baseline_13W"
+        ]
+    ].head()
+)
+
+"""## Chronological Splits for the 13-Week Horizon
+
+We use the same final test target period as the one-week analysis.
+However, its earliest forecast origin occurs 13 weeks earlier.
+
+Validation targets must be observed by that earliest test origin,
+and training targets must be observed by the earliest validation
+origin. These gaps protect both training and model selection
+from future information.
+"""
+
+required_variables = [
+    "pd",
+    "sales",
+    "features",
+    "model_data",
+    "test_start",
+    "horizon_data"
+]
+
+for name in required_variables:
+    print(name, "→", "Available" if name in globals() else "Missing")
+
+horizon_observed = horizon_data.dropna(
+    subset=["Target_Sales"]
+).copy()
+
+test_origin_start_13 = (
+    test_start - pd.Timedelta(weeks=13)
+)
+
+validation_end_13 = test_origin_start_13
+validation_start_13 = (
+    validation_end_13 - pd.Timedelta(weeks=12)
+)
+
+training_end_13 = (
+    validation_start_13 - pd.Timedelta(weeks=13)
+)
+
+train_13 = horizon_observed[
+    horizon_observed["Target_Date"] <= training_end_13
+].copy()
+
+validation_13 = horizon_observed[
+    horizon_observed["Target_Date"].between(
+        validation_start_13,
+        validation_end_13
+    )
+].copy()
+
+test_13 = horizon_observed[
+    horizon_observed["Target_Date"] >= test_start
+].copy()
+
+assert (
+    train_13["Target_Date"].max()
+    <= validation_13["Origin_Date"].min()
+)
+
+assert (
+    validation_13["Target_Date"].max()
+    <= test_13["Origin_Date"].min()
+)
+
+print("Training target cutoff:", training_end_13.date())
+print("Validation targets:", validation_start_13.date(),
+      "to", validation_end_13.date())
+print("Earliest test origin:", test_origin_start_13.date())
+print("Test targets start:", test_start.date())
+
+"""## Selecting Inputs for the 13-Week Model
+
+We use store attributes, sales available at the forecast origin,
+historical sales summaries, and the target week's calendar features.
+
+Target sales are excluded from inputs. Numerical features with
+no variation in training are excluded using training data only.
+"""
+
+categorical_features_13 = ["Store", "Dept", "Type"]
+
+numeric_features_13 = [
+    "Size",
+    "Origin_Sales",
+    "Last_Week_Sales",
+    "Sales_52_Weeks_Ago",
+    "Sales_Lag_2",
+    "Sales_Lag_4",
+    "Sales_Lag_8",
+    "Recent_Sales_Mean",
+    "Recent_Sales_Std",
+    "Available_Recent_Lags",
+    "Target_Seasonal_Sales",
+    "Target_Year",
+    "Target_Month",
+    "Target_Week",
+    "Target_Quarter",
+    "Target_IsHoliday"
+]
+
+for dataset in [train_13, validation_13, test_13]:
+    dataset["Target_IsHoliday"] = (
+        dataset["Target_IsHoliday"].astype("float64")
+    )
+
+usable_numeric_13 = [
+    column for column in numeric_features_13
+    if train_13[column].nunique(dropna=True) > 1
+]
+
+forecast_features_13 = (
+    categorical_features_13 + usable_numeric_13
+)
+
+X_train_13 = train_13[forecast_features_13].copy()
+y_train_13 = train_13["Target_Sales"].copy()
+
+X_validation_13 = validation_13[forecast_features_13].copy()
+y_validation_13 = validation_13["Target_Sales"].copy()
+
+assert "Target_Sales" not in forecast_features_13
+assert X_train_13.index.equals(y_train_13.index)
+
+print("Training inputs:", X_train_13.shape)
+print("Validation inputs:", X_validation_13.shape)
+
+print(
+    "Excluded columns:",
+    [
+        column for column in numeric_features_13
+        if column not in usable_numeric_13
+    ]
+)
+
+"""## Training a Direct 13-Week Forecasting Model
+
+We train a separate gradient boosting model to predict sales
+exactly 13 weeks after each forecast origin.
+
+Fresh preprocessing is fitted only on the horizon-specific
+training data. Regression settings remain fixed. This is a direct
+forecast rather than repeated one-week predictions.
+"""
+
+from sklearn.base import clone
+
+preprocessor_13 = ColumnTransformer(
+    transformers=[
+        (
+            "categories",
+            clone(categorical_preprocessor),
+            categorical_features_13
+        ),
+        (
+            "numbers",
+            clone(numeric_preprocessor),
+            usable_numeric_13
+        )
+    ],
+    remainder="drop"
+)
+
+forecast_model_13 = Pipeline(
+    steps=[
+        ("preprocessing", preprocessor_13),
+        (
+            "regression",
+            clone(forecast_model.named_steps["regression"])
+        )
+    ]
+)
+
+forecast_model_13.fit(X_train_13, y_train_13)
+
+validation_13["Model_Prediction_13W"] = (
+    forecast_model_13.predict(X_validation_13)
+)
+
+print("13-week model trained.")
+print("Validation predictions generated.")
+
+"""## Comparing 13-Week Forecasting Approaches
+
+We compare the direct model with origin-sales and seasonal
+baselines on identical validation observations.
+
+We select the approach with the lowest validation MAE.
+Baselines remain eligible: a complex model is not preferred
+unless its validation results support that choice.
+
+The 13-week test outcomes are not used in this selection.
+"""
+
+validation_results_13 = []
+
+for name, column in [
+    ("Origin-sales baseline", "Origin_Sales"),
+    ("Seasonal baseline", "Seasonal_Baseline_13W"),
+    ("Direct 13-week boosting", "Model_Prediction_13W")
+]:
+    actual = validation_13["Target_Sales"]
+    predicted = validation_13[column]
+
+    assert predicted.notna().all()
+
+    error = actual - predicted
+
+    validation_results_13.append({
+        "Model": name,
+        "MAE": error.abs().mean(),
+        "RMSE": np.sqrt((error ** 2).mean()),
+        "WAPE_Percent": (
+            error.abs().sum() / actual.abs().sum() * 100
+        )
+    })
+
+comparison_13 = pd.DataFrame(validation_results_13)
+
+display(comparison_13.round(2))
+
+best_13_name = comparison_13.loc[
+    comparison_13["MAE"].idxmin(),
+    "Model"
+]
+
+print("Selected approach:", best_13_name)
+
+comparison_13.to_csv(
+    output_folder / "validation_13_week_comparison.csv",
+    index=False
+)
+
+"""## Finalizing the 13-Week Forecasting Approach
+
+The seasonal baseline achieved the lowest validation MAE,
+although boosting achieved a lower RMSE. We retain MAE as
+the selection criterion and select the seasonal baseline.
+
+This baseline requires no model refitting. It uses sales
+52 weeks before each target date, falling back to origin sales
+when the seasonal reference is unavailable.
+"""
+
+assert best_13_name == "Seasonal baseline", (
+    "The selected approach differs. Review before continuing."
+)
+
+test_results_13 = test_13[
+    [
+        "Store",
+        "Dept",
+        "Origin_Date",
+        "Target_Date",
+        "Origin_Sales",
+        "Target_Sales",
+        "Target_Seasonal_Sales",
+        "Seasonal_Baseline_13W"
+    ]
+].copy()
+
+test_results_13["Selected_Prediction"] = (
+    test_results_13["Seasonal_Baseline_13W"]
+)
+
+test_results_13["Used_Fallback"] = (
+    test_results_13["Target_Seasonal_Sales"].isna()
+)
+
+assert test_results_13["Selected_Prediction"].notna().all()
+
+assert (
+    test_results_13["Target_Date"]
+    - test_results_13["Origin_Date"]
+).eq(pd.Timedelta(weeks=13)).all()
+
+print("Test observations:", len(test_results_13))
+print(
+    "Fallback observations:",
+    test_results_13["Used_Fallback"].sum()
+)
+
+display(test_results_13.head())
+
+"""## Evaluating the Selected 13-Week Approach
+
+We evaluate the selected seasonal baseline and the origin-sales
+reference on identical test observations.
+
+The selection is frozen before this evaluation. Test results
+describe performance on the observed store-department pairs;
+pairs without an observed origin or target are not evaluated.
+"""
+
+test_metric_rows_13 = []
+
+for name, column in [
+    ("Origin-sales baseline", "Origin_Sales"),
+    ("Selected seasonal baseline", "Selected_Prediction")
+]:
+    actual = test_results_13["Target_Sales"]
+    predicted = test_results_13[column]
+
+    error = actual - predicted
+
+    test_metric_rows_13.append({
+        "Model": name,
+        "MAE": error.abs().mean(),
+        "RMSE": np.sqrt((error ** 2).mean()),
+        "WAPE_Percent": (
+            error.abs().sum() / actual.abs().sum() * 100
+        )
+    })
+
+test_metrics_13 = pd.DataFrame(test_metric_rows_13)
+
+display(test_metrics_13.round(2))
+
+"""## Visualizing the 13-Week Test Forecast
+
+We compare weekly totals of actual sales and selected seasonal
+predictions for the scored test observations.
+
+Each target week's prediction was formed from information
+available at its corresponding origin 13 weeks earlier.
+The chart represents rolling origins, not one fixed-origin
+forecast covering the entire test period.
+"""
+
+weekly_test_13 = (
+    test_results_13.groupby("Target_Date")[
+        ["Target_Sales", "Selected_Prediction"]
+    ]
+    .sum()
+    .rename(columns={
+        "Target_Sales": "Actual sales",
+        "Selected_Prediction": "Seasonal prediction"
+    })
+)
+
+(weekly_test_13 / 1_000_000).plot(
+    figsize=(12, 5),
+    marker="o"
+)
+
+plt.title("13-Week-Ahead Test: Actual vs Selected Forecast")
+plt.xlabel("Target Week")
+plt.ylabel("Sales Amount (Millions)")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+
+plt.savefig(
+    output_folder / "13_week_test_forecast.png",
+    dpi=150,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+test_metrics_13.to_csv(
+    output_folder / "13_week_test_metrics.csv",
+    index=False
+)
+
+test_results_13.to_csv(
+    output_folder / "13_week_test_predictions.csv",
+    index=False
+)
+
+print("Saved 13-week test metrics, predictions, and chart.")
+
+"""## Saving Forecasting Artifacts
+
+We save the fitted one-week forecasting pipeline, its input
+feature names, and the selected 13-week seasonal forecasting rule.
+
+The one-week pipeline includes fitted preprocessing. The seasonal
+baseline has no fitted estimator, so its horizon, reference lag,
+and fallback rule are recorded instead.
+
+Package versions are saved to support reproducibility.
+"""
+
+import joblib
+import sklearn
+
+model_folder = data_folder.parent / "models"
+model_folder.mkdir(parents=True, exist_ok=True)
+
+forecast_bundle = {
+    "one_week": {
+        "pipeline": final_core_model,
+        "features": forecast_features,
+        "horizon_weeks": 1,
+        "training_target_end": str(
+            final_training_data["Date"].max().date()
+        )
+    },
+    "thirteen_week": {
+        "selected_method": "Seasonal baseline",
+        "horizon_weeks": 13,
+        "seasonal_reference_weeks_before_target": 52,
+        "fallback": "Sales observed at forecast origin"
+    },
+    "versions": {
+        "pandas": pd.__version__,
+        "numpy": np.__version__,
+        "scikit_learn": sklearn.__version__,
+        "joblib": joblib.__version__
+    }
+}
+
+forecast_path = model_folder / "forecasting_artifacts.joblib"
+
+joblib.dump(forecast_bundle, forecast_path)
+
+print("Forecasting artifacts saved:", forecast_path.exists())
+print("Location:", forecast_path)
+
+"""## Saving Segmentation and Anomaly Artifacts
+
+We save the clustering model with its fitted scaler and feature
+order. We also save Isolation Forest with its training medians
+and input columns.
+
+The robust detector's training statistics and threshold are
+preserved so that later observations can be evaluated using
+the same rules.
+"""
+
+analysis_bundle = {
+    "segmentation": {
+        "model": best_cluster_model,
+        "scaler": cluster_scaler,
+        "features": cluster_features,
+        "segment_names": segment_names
+    },
+    "isolation_forest": {
+        "model": isolation_model,
+        "features": anomaly_features,
+        "training_medians": training_medians
+    },
+    "robust_detector": {
+        "training_statistics": change_stats,
+        "threshold": 5,
+        "minimum_valid_changes": 20,
+        "mad_scale_factor": 1.4826
+    },
+    "training_date_exclusive_end": str(validation_start.date()),
+    "versions": forecast_bundle["versions"]
+}
+
+analysis_path = model_folder / "analysis_artifacts.joblib"
+
+joblib.dump(analysis_bundle, analysis_path)
+
+print("Analysis artifacts saved:", analysis_path.exists())
+print("Location:", analysis_path)
+
+"""## Verifying Model Reloading
+
+We reload the forecasting artifact and compare predictions
+against the original in-memory pipeline on five test inputs.
+
+Matching predictions confirm that serialization preserved the
+pipeline's behavior on these inputs. This does not replace
+forecast evaluation or validate future deployment conditions.
+"""
+
+loaded_forecast = joblib.load(forecast_path)
+
+loaded_pipeline = loaded_forecast["one_week"]["pipeline"]
+loaded_features = loaded_forecast["one_week"]["features"]
+
+sample_inputs = X_test_core.loc[:, loaded_features].head(5)
+
+original_predictions = final_core_model.predict(sample_inputs)
+reloaded_predictions = loaded_pipeline.predict(sample_inputs)
+
+np.testing.assert_allclose(
+    original_predictions,
+    reloaded_predictions,
+    rtol=1e-10,
+    atol=1e-8
+)
+
+display(
+    pd.DataFrame({
+        "Original_Prediction": original_predictions,
+        "Reloaded_Prediction": reloaded_predictions
+    }).round(2)
+)
+
+print("Reload verification passed: predictions match.")
+
+"""## Refitting for Future Forecasting
+
+After completing evaluation, we refit the selected one-week
+pipeline on all available historical sales without changing
+its settings.
+
+The evaluation model remains separate. The newly fitted model
+is used for forecasts beyond the observed dataset.
+
+Forecast coverage is restricted to store-department pairs
+observed in the latest sales week.
+"""
+
+last_observed_date = model_data["Date"].max()
+
+future_core_model = clone(final_core_model)
+
+future_core_model.fit(
+    model_data[forecast_features],
+    model_data["Weekly_Sales"]
+)
+
+active_pairs = model_data.loc[
+    model_data["Date"] == last_observed_date,
+    ["Store", "Dept", "Type", "Size"]
+].copy()
+
+assert not active_pairs.duplicated(["Store", "Dept"]).any()
+
+print("Last observed date:", last_observed_date.date())
+print("Store-department pairs to forecast:", len(active_pairs))
+print("Future forecasting model trained.")
+
+"""## Forecasting the Next Week
+
+We construct next-week inputs using exact historical sales lags,
+store attributes, and known calendar information.
+
+Target-week actual sales and external measurements are not used.
+The holiday flag is treated as advance calendar information.
+Missing history is handled by the fitted preprocessing pipeline.
+"""
+
+next_week_date = last_observed_date + pd.Timedelta(weeks=1)
+
+future_inputs = active_pairs.copy()
+future_inputs["Date"] = next_week_date
+
+future_inputs["Year"] = future_inputs["Date"].dt.year
+future_inputs["Month"] = future_inputs["Date"].dt.month
+future_inputs["WeekOfYear"] = (
+    future_inputs["Date"].dt.isocalendar().week.astype(int)
+)
+future_inputs["Quarter"] = future_inputs["Date"].dt.quarter
+
+future_inputs = future_inputs.merge(
+    features[["Store", "Date", "IsHoliday"]],
+    on=["Store", "Date"],
+    how="left",
+    validate="many_to_one"
+)
+
+assert future_inputs["IsHoliday"].notna().all(), (
+    "Future holiday calendar information is missing."
+)
+
+sales_lookup = merged_data.set_index(
+    ["Store", "Dept", "Date"]
+)["Weekly_Sales"]
+
+lag_definitions = {
+    "Last_Week_Sales": 1,
+    "Sales_52_Weeks_Ago": 52,
+    "Sales_Lag_2": 2,
+    "Sales_Lag_4": 4,
+    "Sales_Lag_8": 8
+}
+
+for column, weeks in lag_definitions.items():
+    lookup_keys = pd.MultiIndex.from_arrays([
+        future_inputs["Store"],
+        future_inputs["Dept"],
+        future_inputs["Date"] - pd.Timedelta(weeks=weeks)
+    ])
+
+    future_inputs[column] = (
+        sales_lookup.reindex(lookup_keys).to_numpy()
+    )
+
+future_inputs["Recent_Sales_Mean"] = (
+    future_inputs[recent_lag_columns].mean(axis=1)
+)
+future_inputs["Recent_Sales_Std"] = (
+    future_inputs[recent_lag_columns].std(axis=1)
+)
+future_inputs["Available_Recent_Lags"] = (
+    future_inputs[recent_lag_columns].notna().sum(axis=1)
+)
+
+future_one_week = future_inputs[
+    ["Store", "Dept", "Date"]
+].rename(columns={"Date": "Target_Date"})
+
+future_one_week["Prediction"] = future_core_model.predict(
+    future_inputs[forecast_features]
+)
+
+future_one_week["Origin_Date"] = last_observed_date
+future_one_week["Horizon_Weeks"] = 1
+future_one_week["Method"] = "Core gradient boosting"
+
+display(future_one_week.head().round(2))
+
+"""## Producing and Saving Future Forecasts
+
+For the selected 13-week seasonal approach, we use sales
+52 weeks before the target date. If unavailable, we use
+sales observed at the forecast origin.
+
+We save forecasts for two target weeks: one week and thirteen
+weeks after the dataset ends. These are not forecasts for
+every intervening week. Actual future outcomes are unavailable,
+so forecast errors cannot yet be calculated.
+"""
+
+target_date_13 = last_observed_date + pd.Timedelta(weeks=13)
+
+future_thirteen_week = active_pairs[["Store", "Dept"]].copy()
+future_thirteen_week["Target_Date"] = target_date_13
+
+seasonal_keys = pd.MultiIndex.from_arrays([
+    future_thirteen_week["Store"],
+    future_thirteen_week["Dept"],
+    future_thirteen_week["Target_Date"] - pd.Timedelta(weeks=52)
+])
+
+origin_keys = pd.MultiIndex.from_arrays([
+    future_thirteen_week["Store"],
+    future_thirteen_week["Dept"],
+    pd.Series(
+        last_observed_date,
+        index=future_thirteen_week.index
+    )
+])
+
+future_thirteen_week["Seasonal_Reference"] = (
+    sales_lookup.reindex(seasonal_keys).to_numpy()
+)
+
+future_thirteen_week["Origin_Sales"] = (
+    sales_lookup.reindex(origin_keys).to_numpy()
+)
+
+future_thirteen_week["Used_Fallback"] = (
+    future_thirteen_week["Seasonal_Reference"].isna()
+)
+
+future_thirteen_week["Prediction"] = (
+    future_thirteen_week["Seasonal_Reference"]
+    .fillna(future_thirteen_week["Origin_Sales"])
+)
+
+future_thirteen_week["Origin_Date"] = last_observed_date
+future_thirteen_week["Horizon_Weeks"] = 13
+future_thirteen_week["Method"] = "Seasonal baseline"
+
+assert future_thirteen_week["Prediction"].notna().all()
+
+future_one_week.to_csv(
+    output_folder / "future_one_week_forecast.csv",
+    index=False
+)
+
+future_thirteen_week.to_csv(
     output_folder / "future_thirteen_week_forecast.csv",
     index=False
 )
